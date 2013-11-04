@@ -1,340 +1,622 @@
 #include <sift.hpp>
 
-
-void sift::LoadImage(const string &file_path)
+sift::sift( int _nfeatures, int _nOctaveLayers,
+    double _contrastThreshold, double _edgeThreshold, double _sigma )
+    : nfeatures(_nfeatures), nOctaveLayers(_nOctaveLayers),
+    contrastThreshold(_contrastThreshold), edgeThreshold(_edgeThreshold), sigma(_sigma)
 {
-    grayimage_ = imread(file_path,0);
-    if(grayimage_.empty())
-    {
-        cout << "无法读取图片: " << file_path << ".\n";
-        exit(-1);
-    }
 }
 
-void sift::AssignOrientations()
+void sift::unpackOctave(const KeyPoint& kpt, int& octave, int& layer, float& scale)
 {
-    cout << "\nAssigning Orientations to keypoints...\n\n";
-    vector<double> hist;
-
-    //对于在DOG金字塔中检测出的关键点点，采集其所在高斯金字塔图像3σ邻域窗口内像素的梯度和方向分布特征
-    //梯度的模值m(x,y)按：1.5*sigma 的高斯分布加成，即：ORI_SIGMA_TIMES*extrema[i].octave_scale
-    //ORI_HIST_BINS=36 //梯度直方图将0~360度的方向范围分为36个柱(bins)，其中每柱10度
-    //ORI_SIGMA_TIME = 1.5
-    //ORI_WINDOW_RADIUS = 3.0*ORI_SIGMA_TIME
-    CalculateOrientationHistogram(grayimage_,
-        cvRound(descriptor_.x), cvRound(descriptor_.y), 
-        36,            //36 bins
-        4, 
-        3, 
-        hist);                    //返回的是36大小的数组指针
-    for(int j = 0; j < 2; j++)
-        GaussSmoothOriHist(hist, 36);
-    //随着距中心点越远的领域其对直方图的贡献也响应减小.Lowe论文中还提到要使用高斯函数对直方图进行平滑，减少突变的影响。
-    //由于SIFT算法只考虑了尺度和旋转不变性，并没有考虑仿射不变性。
-    //通过高斯加权，使特征点附近的梯度幅值有较大的权重，这样可以部分弥补因没有仿射不变性而产生的特征点不稳定的问题。
-
-    descriptor_.orientation = DominantDirection(hist, 36);//直方图的峰值代表该特征点处邻域内图像梯度的主方向，也即该特征点的主方向
+    octave = kpt.octave & 255;
+    layer = (kpt.octave >> 8) & 255;
+    octave = octave < 128 ? octave : (-128 | octave);
+    scale = octave >= 0 ? 1.f/(1 << octave) : (float)(1 << -octave);
 }
 
-void sift::CalculateOrientationHistogram(const Mat& gauss, int x, int y, int bins, int radius, double sigma, vector<double>& hist)
-{	//radius就是3sigma窗口
-    hist.assign(bins,0.0);
 
-    double mag, ori;
-    double weight;
-    int bin;
-    const double PI2 = 2.0*CV_PI;
-    double econs = -1.0/(2.0*sigma*sigma);
-    for(int i = -radius; i <= radius; i++)
-    {
-        for(int j = -radius; j <= radius; j++)//在取得的区域中统计直方图
-        {
-            if(CalcGradMagOri(gauss, x+i, y+j, mag, ori))//获得位置和方向
-            {
-                weight = exp((i*i+j*j)*econs);//计算权重
-
-                //使用Pi-ori将ori转换到[0,2*PI]之间
-                bin = cvRound(bins * (CV_PI - ori)/PI2);
-                bin = bin < bins ? bin : 0;
-
-                hist[bin] += mag * weight;
-
-                cout <<  "hist[" << bin << "] = " << hist[bin] << endl;
-
-
-            }
-        }
-    }
-}
-
-//计算模值和方向：计算在gauss图像中坐标为xy处的模值和方向
-bool sift::CalcGradMagOri(const Mat& gauss, int x, int y, double& mag, double& ori)
+Mat sift::createInitialImage( const Mat& img, bool doubleImageSize, float sigma )
 {
-    //x 为 Mat中的 col; y 为 Mat中的 row
-    if(x > 0 && x < gauss.cols-1 && y > 0 && y < gauss.rows -1)
+    Mat gray, gray_fpt;
+    if( img.channels() == 3 || img.channels() == 4 )
+        cvtColor(img, gray, COLOR_BGR2GRAY);
+    else
+        img.copyTo(gray);
+    gray.convertTo(gray_fpt, DataType<sift_wt>::type, SIFT_FIXPT_SCALE, 0);
+
+    float sig_diff;
+
+    if( doubleImageSize )
     {
-          //*(img.data + img.step[0]*y + img.step[1]*x) = 255;
-          //  首地址        行row             列col
-          double dx = *(gauss.data + gauss.step[0] * (y+1) + gauss.step[1]*x) -
-                      *(gauss.data + gauss.step[0] * (y-1) + gauss.step[1]*x);
-
-          double dy = *(gauss.data + gauss.step[0] * y + gauss.step[1]*(x+1)) -
-                      *(gauss.data + gauss.step[0] * y + gauss.step[1]*(x-1));
-
-        mag = sqrt(dx*dx + dy*dy);
-        ori = atan2(dx, dy);//atan2返回[-Pi, -Pi]的弧度值
-        return true;
+        sig_diff = sqrtf( std::max(sigma * sigma - SIFT_INIT_SIGMA * SIFT_INIT_SIGMA * 4, 0.01f) );
+        Mat dbl;
+        resize(gray_fpt, dbl, Size(gray.cols*2, gray.rows*2), 0, 0, INTER_LINEAR);
+        GaussianBlur(dbl, dbl, Size(), sig_diff, sig_diff);
+        return dbl;
     }
     else
-        return false;
+    {
+        sig_diff = sqrtf( std::max(sigma * sigma - SIFT_INIT_SIGMA * SIFT_INIT_SIGMA, 0.01f) );
+        GaussianBlur(gray_fpt, gray_fpt, Size(), sig_diff, sig_diff);
+        return gray_fpt;
+    }
 }
 
-void sift::DescriptorRepresentation()
+
+//建立高斯金字塔
+void sift::buildGaussianPyramid( const Mat& base, std::vector<Mat>& pyr, int nOctaves ) const
 {
-    double ***hist;
+    std::vector<double> sig(nOctaveLayers + 3);
+    pyr.resize(nOctaves*(nOctaveLayers + 3));
 
-    hist = CalculateDescrHist(grayimage_,
-        descriptor_.x, descriptor_.y, 1, descriptor_.orientation, 8, 4);
+    // precompute Gaussian sigmas using the following formula:
+    //  \sigma_{total}^2 = \sigma_{i}^2 + \sigma_{i-1}^2
+    sig[0] = sigma;
+    double k = std::pow( 2., 1. / nOctaveLayers );
+    for( int i = 1; i < nOctaveLayers + 3; i++ )
+    {
+        double sig_prev = std::pow(k, (double)(i-1))*sigma;
+        double sig_total = sig_prev*k;
+        sig[i] = std::sqrt(sig_total*sig_total - sig_prev*sig_prev);
+    }
 
-    
-    int  width = 4;
-    int bins = 8;
-
-    int int_val, i, r, c, o, k = 0;
-
-    for( r = 0; r < width; r++ )
-        for( c = 0; c < width; c++ )
-            for( o = 0; o < bins; o++ )
+    for( int o = 0; o < nOctaves; o++ )
+    {
+        for( int i = 0; i < nOctaveLayers + 3; i++ )
+        {
+            Mat& dst = pyr[o*(nOctaveLayers + 3) + i];
+            if( o == 0  &&  i == 0 )
+                dst = base;
+            // base of new octave is halved image from end of previous octave
+            else if( i == 0 )
             {
-                descriptor_.descriptorvector[k++] = hist[r][c][o];//转换为一维向量了
+                const Mat& src = pyr[(o-1)*(nOctaveLayers + 3) + nOctaveLayers];
+                resize(src, dst, Size(src.cols/2, src.rows/2),
+                    0, 0, INTER_NEAREST);
             }
-
-    //feature.descr_length = k;//共有k个特征向量
-
-    NormalizeDescr(descriptor_);//特征矢量形成后，为了去除光照变化的影响，需要对它们进行归一化处理。
-
-    for( i = 0; i < k; i++ )
-    {
-        if( descriptor_.descriptorvector[i] > 0.2 )//在归一化处理后，对于特征矢量中值大于0.2的要进行截断，即大于0.2的值只取0.2
-            descriptor_.descriptorvector[i] = 0.2;
-    }
-    NormalizeDescr(descriptor_);//然后，再进行一次归一化处理，其目的是提高特征的鉴别性。
-
-
-    /* convert floating-point descriptor to integer valued descriptor */
-    for( i = 0; i < k; i++ )
-    {
-        int_val = 512 * descriptor_.descriptorvector[i];      //INT_DESCR_FCTR=512.0
-        descriptor_.descriptorvector[i] = min( 255, int_val );//不能超过255
-    }
-
-
-
-    for(int j = 0; j < 4; j++)
-    {
-
-        for(int k = 0; k < 4; k++)
-        {
-            delete[] hist[j][k];
-        }
-        delete[] hist[j];
-    }
-    delete[] hist;
-}
-
-void sift::NormalizeDescr(Descriptor& feat)//归一化处理
-{
-    double cur, len_inv, len_sq = 0.0;
-    int i, d = 128;
-
-    for( i = 0; i < d; i++ )
-    {
-        cur = feat.descriptorvector[i];
-        len_sq += cur*cur;
-    }
-    len_inv = 1.0 / sqrt( len_sq );
-    for( i = 0; i < d; i++ )
-        feat.descriptorvector[i] *= len_inv;
-}
-
-/************************************************************************/
-/*5.3 对关键点周围图像区域分块，计算块内梯度直方图，生成具有独特性的向量*/
-/* 	(1)确定描述子直方图的邻域的半径;									*/
-/*	(2)将坐标轴旋转到关键点方向;										*/
-/*	(3)将邻域内的采样点分配到对应的子区域内，							*/
-/*	   将子区域内的梯度值分配到8个方向上，计算其权值。				    */
-/************************************************************************/
-double*** sift::CalculateDescrHist(const Mat& gauss, int x, int y, double octave_scale, double ori, int bins, int width)
-{
-    double ***hist = new double**[width];
-
-    //申请空间并初始化
-    for(int i = 0; i < width; i++)
-    {
-        hist[i] = new double*[width];
-        for(int j = 0; j < width; j++)
-        {
-            hist[i][j] = new double[bins];
-        }
-    }
-
-    for(int r = 0; r < width; r++ )
-        for(int c = 0; c < width; c++ )
-            for(int o = 0; o < bins; o++ )
-                hist[r][c][o]=0.0;
-
-
-    double cos_ori = cos(ori);
-    double sin_ori = sin(ori);
-
-    double sigma = 0.5 * width;//Lowe建议子区域的像素的梯度大小按子窗口宽度的一半进行高斯加权计算
-
-    double conste = -1.0/(2*sigma*sigma);
-    double PI2 = CV_PI * 2;
-    double sub_hist_width = 3 * octave_scale;//DESCR_SCALE_ADJUST=3，即3sigma半径
-
-    //实际计算领域半径时，需要采用双线性插值，所需图像窗口边长为3*sigma*(d+1)
-    //在考虑到旋转因素(方便下一步将坐标轴旋转到关键点的方向)，半径变为:r*(sqrt(2.0)/2);
-    //实际计算所需的图像区域半径为：(3sigma*(d+1)*pow(2,0.5))/2
-    int radius = (sub_hist_width*sqrt(2.0)*(width+1))/2.0 + 0.5; //+0.5取四舍五入
-
-    double grad_ori, grad_mag;
-    for(int i = -radius; i <= radius; i++)
-    {
-        for(int j =-radius; j <= radius; j++)
-        {
-            //将坐标轴旋转为关键点的方向，以确保旋转不变性
-            double rot_x = (cos_ori * j - sin_ori * i) / sub_hist_width;
-            double rot_y = (sin_ori * j + cos_ori * i) / sub_hist_width;
-
-
-            //xbin,ybin为落在4*4窗口中的下标值
-            double xbin = rot_x + width/2 - 0.5;
-            double ybin = rot_y + width/2 - 0.5;
-
-            //
-            if(xbin > -1.0 && xbin < width && ybin > -1.0 && ybin < width)
+            else
             {
-                if(CalcGradMagOri(gauss, x+j, y + i, grad_mag, grad_ori))//计算gauss中位于(x+j, y + i)处的权重
+                const Mat& src = pyr[o*(nOctaveLayers + 3) + i-1];
+                GaussianBlur(src, dst, Size(), sig[i], sig[i]);
+            }
+        }
+    }
+}
+
+//建立DoG差分金字塔
+void sift::buildDoGPyramid( const std::vector<Mat>& gpyr, std::vector<Mat>& dogpyr ) const
+{
+    int nOctaves = (int)gpyr.size()/(nOctaveLayers + 3);
+    dogpyr.resize( nOctaves*(nOctaveLayers + 2) );
+
+    for( int o = 0; o < nOctaves; o++ )
+    {
+        for( int i = 0; i < nOctaveLayers + 2; i++ )
+        {
+            const Mat& src1 = gpyr[o*(nOctaveLayers + 3) + i];
+            const Mat& src2 = gpyr[o*(nOctaveLayers + 3) + i + 1];
+            Mat& dst = dogpyr[o*(nOctaveLayers + 2) + i];
+            subtract(src2, src1, dst, noArray(), DataType<sift_wt>::type);
+        }
+    }
+}
+
+//计算指定像素的梯度方向直方图
+float sift::calcOrientationHist( const Mat& img, Point pt, int radius,
+    float sigma, float* hist, int n )
+{
+    int i, j, k, len = (radius*2+1)*(radius*2+1);
+
+    float expf_scale = -1.f/(2.f * sigma * sigma);
+    AutoBuffer<float> buf(len*4 + n+4);
+    float *X = buf, *Y = X + len, *Mag = X, *Ori = Y + len, *W = Ori + len;
+    float* temphist = W + len + 2;
+
+    for( i = 0; i < n; i++ )
+        temphist[i] = 0.f;
+
+    for( i = -radius, k = 0; i <= radius; i++ )
+    {
+        int y = pt.y + i;
+        if( y <= 0 || y >= img.rows - 1 )
+            continue;
+        for( j = -radius; j <= radius; j++ )
+        {
+            int x = pt.x + j;
+            if( x <= 0 || x >= img.cols - 1 )
+                continue;
+
+            float dx = (float)(img.at<sift_wt>(y, x+1) - img.at<sift_wt>(y, x-1));
+            float dy = (float)(img.at<sift_wt>(y-1, x) - img.at<sift_wt>(y+1, x));
+
+            X[k] = dx; Y[k] = dy; W[k] = (i*i + j*j)*expf_scale;
+            k++;
+        }
+    }
+
+    len = k;
+
+    // compute gradient values, orientations and the weights over the pixel neighborhood
+    exp(W, W, len);
+    fastAtan2(Y, X, Ori, len, true);
+    magnitude(X, Y, Mag, len);
+
+    for( k = 0; k < len; k++ )
+    {
+        int bin = cvRound((n/360.f)*Ori[k]);
+        if( bin >= n )
+            bin -= n;
+        if( bin < 0 )
+            bin += n;
+        temphist[bin] += W[k]*Mag[k];
+    }
+
+    // smooth the histogram
+    temphist[-1] = temphist[n-1];
+    temphist[-2] = temphist[n-2];
+    temphist[n] = temphist[0];
+    temphist[n+1] = temphist[1];
+    for( i = 0; i < n; i++ )
+    {
+        hist[i] = (temphist[i-2] + temphist[i+2])*(1.f/16.f) +
+            (temphist[i-1] + temphist[i+1])*(4.f/16.f) +
+            temphist[i]*(6.f/16.f);
+    }
+
+    float maxval = hist[0];
+    for( i = 1; i < n; i++ )
+        maxval = std::max(maxval, hist[i]);
+
+    return maxval;
+}
+
+// Interpolates a scale-space extremum's location and scale to subpixel
+// accuracy to form an image feature. Rejects features with low contrast.
+// Based on Section 4 of Lowe's paper.
+bool sift::adjustLocalExtrema( const std::vector<Mat>& dog_pyr, KeyPoint& kpt, int octv,
+                         int& layer, int& r, int& c, int nOctaveLayers,
+                         float contrastThreshold, float edgeThreshold, float sigma )
+{
+    const float img_scale = 1.f/(255*SIFT_FIXPT_SCALE);
+    const float deriv_scale = img_scale*0.5f;
+    const float second_deriv_scale = img_scale;
+    const float cross_deriv_scale = img_scale*0.25f;
+
+    float xi=0, xr=0, xc=0, contr=0;
+    int i = 0;
+
+    for( ; i < SIFT_MAX_INTERP_STEPS; i++ )
+    {
+        int idx = octv*(nOctaveLayers+2) + layer;
+        const Mat& img = dog_pyr[idx];
+        const Mat& prev = dog_pyr[idx-1];
+        const Mat& next = dog_pyr[idx+1];
+
+        Vec3f dD((img.at<sift_wt>(r, c+1) - img.at<sift_wt>(r, c-1))*deriv_scale,
+            (img.at<sift_wt>(r+1, c) - img.at<sift_wt>(r-1, c))*deriv_scale,
+            (next.at<sift_wt>(r, c) - prev.at<sift_wt>(r, c))*deriv_scale);
+
+        float v2 = (float)img.at<sift_wt>(r, c)*2;
+        float dxx = (img.at<sift_wt>(r, c+1) + img.at<sift_wt>(r, c-1) - v2)*second_deriv_scale;
+        float dyy = (img.at<sift_wt>(r+1, c) + img.at<sift_wt>(r-1, c) - v2)*second_deriv_scale;
+        float dss = (next.at<sift_wt>(r, c) + prev.at<sift_wt>(r, c) - v2)*second_deriv_scale;
+        float dxy = (img.at<sift_wt>(r+1, c+1) - img.at<sift_wt>(r+1, c-1) -
+            img.at<sift_wt>(r-1, c+1) + img.at<sift_wt>(r-1, c-1))*cross_deriv_scale;
+        float dxs = (next.at<sift_wt>(r, c+1) - next.at<sift_wt>(r, c-1) -
+            prev.at<sift_wt>(r, c+1) + prev.at<sift_wt>(r, c-1))*cross_deriv_scale;
+        float dys = (next.at<sift_wt>(r+1, c) - next.at<sift_wt>(r-1, c) -
+            prev.at<sift_wt>(r+1, c) + prev.at<sift_wt>(r-1, c))*cross_deriv_scale;
+
+        Matx33f H(dxx, dxy, dxs,
+            dxy, dyy, dys,
+            dxs, dys, dss);
+
+        Vec3f X = H.solve(dD, DECOMP_LU);
+
+        xi = -X[2];
+        xr = -X[1];
+        xc = -X[0];
+
+        if( std::abs(xi) < 0.5f && std::abs(xr) < 0.5f && std::abs(xc) < 0.5f )
+            break;
+
+        if( std::abs(xi) > (float)(INT_MAX/3) ||
+            std::abs(xr) > (float)(INT_MAX/3) ||
+            std::abs(xc) > (float)(INT_MAX/3) )
+            return false;
+
+        c += cvRound(xc);
+        r += cvRound(xr);
+        layer += cvRound(xi);
+
+        if( layer < 1 || layer > nOctaveLayers ||
+            c < SIFT_IMG_BORDER || c >= img.cols - SIFT_IMG_BORDER  ||
+            r < SIFT_IMG_BORDER || r >= img.rows - SIFT_IMG_BORDER )
+            return false;
+    }
+
+    // ensure convergence of interpolation
+    if( i >= SIFT_MAX_INTERP_STEPS )
+        return false;
+
+    {
+        int idx = octv*(nOctaveLayers+2) + layer;
+        const Mat& img = dog_pyr[idx];
+        const Mat& prev = dog_pyr[idx-1];
+        const Mat& next = dog_pyr[idx+1];
+        Matx31f dD((img.at<sift_wt>(r, c+1) - img.at<sift_wt>(r, c-1))*deriv_scale,
+            (img.at<sift_wt>(r+1, c) - img.at<sift_wt>(r-1, c))*deriv_scale,
+            (next.at<sift_wt>(r, c) - prev.at<sift_wt>(r, c))*deriv_scale);
+        float t = dD.dot(Matx31f(xc, xr, xi));
+
+        contr = img.at<sift_wt>(r, c)*img_scale + t * 0.5f;
+        if( std::abs( contr ) * nOctaveLayers < contrastThreshold )
+            return false;
+
+        // principal curvatures are computed using the trace and det of Hessian
+        float v2 = img.at<sift_wt>(r, c)*2.f;
+        float dxx = (img.at<sift_wt>(r, c+1) + img.at<sift_wt>(r, c-1) - v2)*second_deriv_scale;
+        float dyy = (img.at<sift_wt>(r+1, c) + img.at<sift_wt>(r-1, c) - v2)*second_deriv_scale;
+        float dxy = (img.at<sift_wt>(r+1, c+1) - img.at<sift_wt>(r+1, c-1) -
+            img.at<sift_wt>(r-1, c+1) + img.at<sift_wt>(r-1, c-1)) * cross_deriv_scale;
+        float tr = dxx + dyy;
+        float det = dxx * dyy - dxy * dxy;
+
+        if( det <= 0 || tr*tr*edgeThreshold >= (edgeThreshold + 1)*(edgeThreshold + 1)*det )
+            return false;
+    }
+
+    kpt.pt.x = (c + xc) * (1 << octv);
+    kpt.pt.y = (r + xr) * (1 << octv);
+    kpt.octave = octv + (layer << 8) + (cvRound((xi + 0.5)*255) << 16);
+    kpt.size = sigma*powf(2.f, (layer + xi) / nOctaveLayers)*(1 << octv)*2;
+    kpt.response = std::abs(contr);
+
+    return true;
+}
+
+// Detects features at extrema in DoG scale space.  Bad features are discarded
+// based on contrast and ratio of principal curvatures.
+void sift::findScaleSpaceExtrema( const std::vector<Mat>& gauss_pyr, const std::vector<Mat>& dog_pyr,
+    std::vector<KeyPoint>& keypoints ) const
+{
+    int nOctaves = (int)gauss_pyr.size()/(nOctaveLayers + 3);
+    int threshold = cvFloor(0.5 * contrastThreshold / nOctaveLayers * 255 * SIFT_FIXPT_SCALE);
+    const int n = SIFT_ORI_HIST_BINS;
+    float hist[n];
+    KeyPoint kpt;
+
+    keypoints.clear();
+
+    for( int o = 0; o < nOctaves; o++ )
+        for( int i = 1; i <= nOctaveLayers; i++ )
+        {
+            int idx = o*(nOctaveLayers+2)+i;
+            const Mat& img = dog_pyr[idx];
+            const Mat& prev = dog_pyr[idx-1];
+            const Mat& next = dog_pyr[idx+1];
+            int step = (int)img.step1();
+            int rows = img.rows, cols = img.cols;
+
+            for( int r = SIFT_IMG_BORDER; r < rows-SIFT_IMG_BORDER; r++)
+            {
+                const sift_wt* currptr = img.ptr<sift_wt>(r);
+                const sift_wt* prevptr = prev.ptr<sift_wt>(r);
+                const sift_wt* nextptr = next.ptr<sift_wt>(r);
+
+                for( int c = SIFT_IMG_BORDER; c < cols-SIFT_IMG_BORDER; c++)
                 {
-                    grad_ori = (CV_PI-grad_ori) - ori;
-                    while(grad_ori < 0.0)
-                        grad_ori += PI2;
-                    while(grad_ori >= PI2)
-                        grad_ori -= PI2;
+                    sift_wt val = currptr[c];
 
-                    double obin = grad_ori * (bins/PI2);
+                    // find local extrema with pixel accuracy
+                    if( std::abs(val) > threshold &&
+                        ((val > 0 && val >= currptr[c-1] && val >= currptr[c+1] &&
+                        val >= currptr[c-step-1] && val >= currptr[c-step] && val >= currptr[c-step+1] &&
+                        val >= currptr[c+step-1] && val >= currptr[c+step] && val >= currptr[c+step+1] &&
+                        val >= nextptr[c] && val >= nextptr[c-1] && val >= nextptr[c+1] &&
+                        val >= nextptr[c-step-1] && val >= nextptr[c-step] && val >= nextptr[c-step+1] &&
+                        val >= nextptr[c+step-1] && val >= nextptr[c+step] && val >= nextptr[c+step+1] &&
+                        val >= prevptr[c] && val >= prevptr[c-1] && val >= prevptr[c+1] &&
+                        val >= prevptr[c-step-1] && val >= prevptr[c-step] && val >= prevptr[c-step+1] &&
+                        val >= prevptr[c+step-1] && val >= prevptr[c+step] && val >= prevptr[c+step+1]) ||
+                        (val < 0 && val <= currptr[c-1] && val <= currptr[c+1] &&
+                        val <= currptr[c-step-1] && val <= currptr[c-step] && val <= currptr[c-step+1] &&
+                        val <= currptr[c+step-1] && val <= currptr[c+step] && val <= currptr[c+step+1] &&
+                        val <= nextptr[c] && val <= nextptr[c-1] && val <= nextptr[c+1] &&
+                        val <= nextptr[c-step-1] && val <= nextptr[c-step] && val <= nextptr[c-step+1] &&
+                        val <= nextptr[c+step-1] && val <= nextptr[c+step] && val <= nextptr[c+step+1] &&
+                        val <= prevptr[c] && val <= prevptr[c-1] && val <= prevptr[c+1] &&
+                        val <= prevptr[c-step-1] && val <= prevptr[c-step] && val <= prevptr[c-step+1] &&
+                        val <= prevptr[c+step-1] && val <= prevptr[c+step] && val <= prevptr[c+step+1])))
+                    {
+                        int r1 = r, c1 = c, layer = i;
+                        if( !adjustLocalExtrema(dog_pyr, kpt, o, layer, r1, c1,
+                            nOctaveLayers, (float)contrastThreshold,
+                            (float)edgeThreshold, (float)sigma) )
+                            continue;
+                        float scl_octv = kpt.size*0.5f/(1 << o);
+                        float omax = calcOrientationHist(gauss_pyr[o*(nOctaveLayers+3) + layer],
+                            Point(c1, r1),
+                            cvRound(SIFT_ORI_RADIUS * scl_octv),
+                            SIFT_ORI_SIG_FCTR * scl_octv,
+                            hist, n);
+                        float mag_thr = (float)(omax * SIFT_ORI_PEAK_RATIO);
+                        for( int j = 0; j < n; j++ )
+                        {
+                            int l = j > 0 ? j - 1 : n - 1;
+                            int r2 = j < n-1 ? j + 1 : 0;
 
-                    double weight = exp(conste*(rot_x*rot_x + rot_y * rot_y));
-
-                    InterpHistEntry(hist, xbin, ybin, obin, grad_mag*weight, bins, width);//插值计算每个种子点八个方向的梯度
+                            if( hist[j] > hist[l]  &&  hist[j] > hist[r2]  &&  hist[j] >= mag_thr )
+                            {
+                                float bin = j + 0.5f * (hist[l]-hist[r2]) / (hist[l] - 2*hist[j] + hist[r2]);
+                                bin = bin < 0 ? n + bin : bin >= n ? bin - n : bin;
+                                kpt.angle = 360.f - (float)((360.f/n) * bin);
+                                if(std::abs(kpt.angle - 360.f) < FLT_EPSILON)
+                                    kpt.angle = 0.f;
+                                keypoints.push_back(kpt);
+                            }
+                        }
+                    }
                 }
             }
         }
-    }
-    return hist;
 }
 
-/************************************************************************/
-/*        		 5.1 插值计算每个种子点八个方向的梯度  				    */
-/************************************************************************/
-void sift::InterpHistEntry(double ***hist, double xbin, double ybin, double obin, double mag, int bins, int d)
+void sift::calcSIFTDescriptor( const Mat& img, Point2f ptf, float ori, float scl,
+    int d, int n, float* dst )
 {
-	double d_r, d_c, d_o, v_r, v_c, v_o;
-	double** row, * h;
-	int r0, c0, o0, rb, cb, ob, r, c, o;
+    Point pt(cvRound(ptf.x), cvRound(ptf.y));
+    float cos_t = cosf(ori*(float)(CV_PI/180));
+    float sin_t = sinf(ori*(float)(CV_PI/180));
+    float bins_per_rad = n / 360.f;
+    float exp_scale = -1.f/(d * d * 0.5f);
+    float hist_width = SIFT_DESCR_SCL_FCTR * scl;
+    int radius = cvRound(hist_width * 1.4142135623730951f * (d + 1) * 0.5f);
+    cos_t /= hist_width;
+    sin_t /= hist_width;
 
-	r0 = cvFloor( ybin );
-	c0 = cvFloor( xbin );
-	o0 = cvFloor( obin );
-	d_r = ybin - r0;
-	d_c = xbin - c0;
-	d_o = obin - o0;
+    int i, j, k, len = (radius*2+1)*(radius*2+1), histlen = (d+2)*(d+2)*(n+2);
+    int rows = img.rows, cols = img.cols;
 
-	/*
-		做插值：
-		xbin,ybin,obin:种子点所在子窗口的位置和方向
-		所有种子点都将落在4*4的窗口中
-		r0,c0取不大于xbin，ybin的正整数
-		r0,c0只能取到0,1,2
-		xbin,ybin在(-1, 2)
+    AutoBuffer<float> buf(len*6 + histlen);
+    float *X = buf, *Y = X + len, *Mag = Y, *Ori = Mag + len, *W = Ori + len;
+    float *RBin = W + len, *CBin = RBin + len, *hist = CBin + len;
 
-		r0取不大于xbin的正整数时。
-		r0+0 <= xbin <= r0+1
-		mag在区间[r0,r1]上做插值
-
-		obin同理
-	*/
-
-	for( r = 0; r <= 1; r++ )
-	{
-		rb = r0 + r;
-		if( rb >= 0  &&  rb < d )
-		{
-			v_r = mag * ( ( r == 0 )? 1.0 - d_r : d_r );
-			row = hist[rb];
-			for( c = 0; c <= 1; c++ )
-			{
-				cb = c0 + c;
-				if( cb >= 0  &&  cb < d )
-				{
-					v_c = v_r * ( ( c == 0 )? 1.0 - d_c : d_c );
-					h = row[cb];
-					for( o = 0; o <= 1; o++ )
-					{
-						ob = ( o0 + o ) % bins;
-						v_o = v_c * ( ( o == 0 )? 1.0 - d_o : d_o );
-						h[ob] += v_o;
-					}
-				}
-			}
-		}
-	}
-}
-
-//高斯平滑，模板为{0.25, 0.5, 0.25}
-void sift::GaussSmoothOriHist(vector<double>& hist, int n)
-{
-    double prev = hist[n-1], temp, h0=hist[0];
-
-
-    for(int i = 0; i < n; i++)
+    for( i = 0; i < d+2; i++ )
     {
-        temp = hist[i];
-        hist[i] = 0.25 * prev + 0.5 * hist[i] + 
-            0.25 * (i+1 >= n ? h0 : hist[i+1]);
-        prev = temp;
+        for( j = 0; j < d+2; j++ )
+            for( k = 0; k < n+2; k++ )
+                hist[(i*(d+2) + j)*(n+2) + k] = 0.;
+    }
+
+    for( i = -radius, k = 0; i <= radius; i++ )
+        for( j = -radius; j <= radius; j++ )
+        {
+            // Calculate sample's histogram array coords rotated relative to ori.
+            // Subtract 0.5 so samples that fall e.g. in the center of row 1 (i.e.
+            // r_rot = 1.5) have full weight placed in row 1 after interpolation.
+            float c_rot = j * cos_t - i * sin_t;
+            float r_rot = j * sin_t + i * cos_t;
+            float rbin = r_rot + d/2 - 0.5f;
+            float cbin = c_rot + d/2 - 0.5f;
+            int r = pt.y + i, c = pt.x + j;
+
+            if( rbin > -1 && rbin < d && cbin > -1 && cbin < d &&
+                r > 0 && r < rows - 1 && c > 0 && c < cols - 1 )
+            {
+                float dx = (float)(img.at<sift_wt>(r, c+1) - img.at<sift_wt>(r, c-1));
+                float dy = (float)(img.at<sift_wt>(r-1, c) - img.at<sift_wt>(r+1, c));
+                X[k] = dx; Y[k] = dy; RBin[k] = rbin; CBin[k] = cbin;
+                W[k] = (c_rot * c_rot + r_rot * r_rot)*exp_scale;
+                k++;
+            }
+        }
+
+        len = k;
+        fastAtan2(Y, X, Ori, len, true);
+        magnitude(X, Y, Mag, len);
+        exp(W, W, len);
+
+        for( k = 0; k < len; k++ )
+        {
+            float rbin = RBin[k], cbin = CBin[k];
+            float obin = (Ori[k] - ori)*bins_per_rad;
+            float mag = Mag[k]*W[k];
+
+            int r0 = cvFloor( rbin );
+            int c0 = cvFloor( cbin );
+            int o0 = cvFloor( obin );
+            rbin -= r0;
+            cbin -= c0;
+            obin -= o0;
+
+            if( o0 < 0 )
+                o0 += n;
+            if( o0 >= n )
+                o0 -= n;
+
+            // histogram update using tri-linear interpolation
+            float v_r1 = mag*rbin, v_r0 = mag - v_r1;
+            float v_rc11 = v_r1*cbin, v_rc10 = v_r1 - v_rc11;
+            float v_rc01 = v_r0*cbin, v_rc00 = v_r0 - v_rc01;
+            float v_rco111 = v_rc11*obin, v_rco110 = v_rc11 - v_rco111;
+            float v_rco101 = v_rc10*obin, v_rco100 = v_rc10 - v_rco101;
+            float v_rco011 = v_rc01*obin, v_rco010 = v_rc01 - v_rco011;
+            float v_rco001 = v_rc00*obin, v_rco000 = v_rc00 - v_rco001;
+
+            int idx = ((r0+1)*(d+2) + c0+1)*(n+2) + o0;
+            hist[idx] += v_rco000;
+            hist[idx+1] += v_rco001;
+            hist[idx+(n+2)] += v_rco010;
+            hist[idx+(n+3)] += v_rco011;
+            hist[idx+(d+2)*(n+2)] += v_rco100;
+            hist[idx+(d+2)*(n+2)+1] += v_rco101;
+            hist[idx+(d+3)*(n+2)] += v_rco110;
+            hist[idx+(d+3)*(n+2)+1] += v_rco111;
+        }
+
+        // finalize histogram, since the orientation histograms are circular
+        for( i = 0; i < d; i++ )
+            for( j = 0; j < d; j++ )
+            {
+                int idx = ((i+1)*(d+2) + (j+1))*(n+2);
+                hist[idx] += hist[idx+n];
+                hist[idx+1] += hist[idx+n+1];
+                for( k = 0; k < n; k++ )
+                    dst[(i*d + j)*n + k] = hist[idx+k];
+            }
+            // copy histogram to the descriptor,
+            // apply hysteresis thresholding
+            // and scale the result, so that it can be easily converted
+            // to byte array
+            float nrm2 = 0;
+            len = d*d*n;
+            for( k = 0; k < len; k++ )
+                nrm2 += dst[k]*dst[k];
+            float thr = std::sqrt(nrm2)*SIFT_DESCR_MAG_THR;
+            for( i = 0, nrm2 = 0; i < k; i++ )
+            {
+                float val = std::min(dst[i], thr);
+                dst[i] = val;
+                nrm2 += val*val;
+            }
+            nrm2 = SIFT_INT_DESCR_FCTR/std::max(std::sqrt(nrm2), FLT_EPSILON);
+
+#if 1
+            for( k = 0; k < len; k++ )
+            {
+                dst[k] = saturate_cast<uchar>(dst[k]*nrm2);
+            }
+#else
+            float nrm1 = 0;
+            for( k = 0; k < len; k++ )
+            {
+                dst[k] *= nrm2;
+                nrm1 += dst[k];
+            }
+            nrm1 = 1.f/std::max(nrm1, FLT_EPSILON);
+            for( k = 0; k < len; k++ )
+            {
+                dst[k] = std::sqrt(dst[k] * nrm1);//saturate_cast<uchar>(std::sqrt(dst[k] * nrm1)*SIFT_INT_DESCR_FCTR);
+            }
+#endif
+}
+
+void sift::calcDescriptors(const std::vector<Mat>& gpyr, const std::vector<KeyPoint>& keypoints,
+    Mat& descriptors, int nOctaveLayers, int firstOctave )
+{
+    int d = SIFT_DESCR_WIDTH, n = SIFT_DESCR_HIST_BINS;
+
+    for( size_t i = 0; i < keypoints.size(); i++ )
+    {
+        KeyPoint kpt = keypoints[i];
+        int octave, layer;
+        float scale;
+        unpackOctave(kpt, octave, layer, scale);
+        CV_Assert(octave >= firstOctave && layer <= nOctaveLayers+2);
+        float size=kpt.size*scale;
+        Point2f ptf(kpt.pt.x*scale, kpt.pt.y*scale);
+        const Mat& img = gpyr[(octave - firstOctave)*(nOctaveLayers + 3) + layer];
+
+        float angle = 360.f - kpt.angle;
+        if(std::abs(angle - 360.f) < FLT_EPSILON)
+            angle = 0.f;
+        calcSIFTDescriptor(img, ptf, angle, size*0.5f, d, n, descriptors.ptr<float>((int)i));
     }
 }
 
-/************************************************************************/
-/*        		 		4.3 直方图的极值查找	    				    */
-/************************************************************************/
-double sift::DominantDirection(vector<double>& hist, int n)
+void sift::dosift(InputArray _image, InputArray _mask,
+    std::vector<KeyPoint>& keypoints,
+    OutputArray _descriptors,
+    bool useProvidedKeypoints) const
 {
-    double maxd = hist[0];
-    for(int i = 1; i < n; i++)
-    {
-        if(hist[i] > maxd)
-            maxd = hist[i];
-    }
-    return maxd;
-}
+    clock_t usingtime;
 
-void sift::write_features(string &file)
-{
-    ofstream dout(file);
-    dout << "the demain is:" << 128 <<endl<<endl;
 
-    dout<<"(x,y):"<<"("<<descriptor_.x << ", " << descriptor_.y  << ")" << endl;//dout<<"关键点坐标(x,y):"<<"("features[i].dx<<", "<<features[i].dy<<")"<<endl;
-    dout<<"scale:"<<descriptor_.scale  << endl << "orientation:" << descriptor_.orientation << endl;//dout<<"尺度(scale):"<<features[i].scale<<endl<<"关键点的梯度方向(orientation):"<<features[i].ori<<endl;
-    dout<<"vector is:"<<endl;//dout<<"16个种子点的8个方向向量的信息共128个信息:"<<endl;
-    for(int j = 0; j < 128; j++)
+    int firstOctave = -1, actualNOctaves = 0, actualNLayers = 0;
+    Mat image = _image.getMat(), mask = _mask.getMat();
+
+    if( image.empty() || image.depth() != CV_8U )
+        CV_Error( Error::StsBadArg, "image is empty or has incorrect depth (!=CV_8U)" );
+
+    if( !mask.empty() && mask.type() != CV_8UC1 )
+        CV_Error( Error::StsBadArg, "mask has incorrect type (!=CV_8UC1)" );
+
+    usingtime = clock();
+    cout << "Calculating...\n";
+    if( useProvidedKeypoints )
     {
-        if(j % 20 == 0)
-            dout<<endl;
-        dout << descriptor_.descriptorvector[j]<<" "; 
+        firstOctave = 0;
+        int maxOctave = INT_MIN;
+        for( size_t i = 0; i < keypoints.size(); i++ )
+        {
+            int octave, layer;
+            float scale;
+            unpackOctave(keypoints[i], octave, layer, scale);
+            firstOctave = std::min(firstOctave, octave);
+            maxOctave = std::max(maxOctave, octave);
+            actualNLayers = std::max(actualNLayers, layer-2);
+        }
+
+        firstOctave = std::min(firstOctave, 0);
+        CV_Assert( firstOctave >= -1 && actualNLayers <= nOctaveLayers );
+        actualNOctaves = maxOctave - firstOctave + 1;
     }
-    dout<<endl<<endl<<endl;
-    dout.close();
+
+    Mat base = createInitialImage(image, firstOctave < 0, (float)sigma);
+    std::vector<Mat> gpyr, dogpyr;
+    int nOctaves = actualNOctaves > 0 ? actualNOctaves : cvRound(std::log( (double)std::min( base.cols, base.rows ) ) / std::log(2.) - 2) - firstOctave;
+
+    //double t, tf = getTickFrequency();
+    //t = (double)getTickCount();
+    buildGaussianPyramid(base, gpyr, nOctaves);
+    buildDoGPyramid(gpyr, dogpyr);
+
+    //t = (double)getTickCount() - t;
+    //printf("pyramid construction time: %g\n", t*1000./tf);
+
+    if( !useProvidedKeypoints )
+    {
+        //t = (double)getTickCount();
+        findScaleSpaceExtrema(gpyr, dogpyr, keypoints);
+        KeyPointsFilter::removeDuplicated( keypoints );
+
+        if( nfeatures > 0 )
+            KeyPointsFilter::retainBest(keypoints, nfeatures);
+        //t = (double)getTickCount() - t;
+        //printf("keypoint detection time: %g\n", t*1000./tf);
+
+        if( firstOctave < 0 )
+            for( size_t i = 0; i < keypoints.size(); i++ )
+            {
+                KeyPoint& kpt = keypoints[i];
+                float scale = 1.f/(float)(1 << -firstOctave);
+                kpt.octave = (kpt.octave & ~255) | ((kpt.octave + firstOctave) & 255);
+                kpt.pt *= scale;
+                kpt.size *= scale;
+            }
+
+            if( !mask.empty() )
+                KeyPointsFilter::runByPixelsMask( keypoints, mask );
+    }
+    else
+    {
+        // filter keypoints by mask
+        //KeyPointsFilter::runByPixelsMask( keypoints, mask );
+    }
+
+    if( _descriptors.needed() )
+    {
+        //t = (double)getTickCount();
+        int dsize = SIFT_DESCR_WIDTH*SIFT_DESCR_WIDTH*SIFT_DESCR_HIST_BINS;
+        _descriptors.create((int)keypoints.size(), dsize, CV_32F);
+        Mat descriptors = _descriptors.getMat();
+
+        calcDescriptors(gpyr, keypoints, descriptors, nOctaveLayers, firstOctave);
+        //t = (double)getTickCount() - t;
+        //printf("descriptor extraction time: %g\n", t*1000./tf);
+    }
+    usingtime = clock() - usingtime;
+    printf ("It took %f seconds).\n",((float)usingtime)/CLOCKS_PER_SEC);
 }

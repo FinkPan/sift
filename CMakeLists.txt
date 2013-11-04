@@ -29,14 +29,16 @@ target_link_libraries(sift opencv_features2d300d.lib
                                              opencv_features2d300d.lib
                                              opencv_highgui300d.lib
                                              opencv_nonfree300d.lib
-                                             opencv_imgproc300d.lib)
+                                             opencv_imgproc300d.lib
+                                             opencv_flann300d.lib)
                                              
 set(lib_names  opencv_features2d300d.dll
                         opencv_core300d.dll
                         opencv_features2d300d.dll
                         opencv_highgui300d.dll
                         opencv_nonfree300d.dll
-                        opencv_imgproc300d.dll)  
+                        opencv_imgproc300d.dll
+                        opencv_flann300d.dll)  
 
 #生成可执行文件			  
 add_executable(tools ${tool})

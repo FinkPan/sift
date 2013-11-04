@@ -2,12 +2,19 @@
 
 int main()
 {
-    string imagefile = "..//data//1-0.jpg";
-    string featurefile = "..//data//1-0.txt";
-    sift mysift(463.136,296.659);
-    mysift.LoadImage(imagefile);
-    mysift.AssignOrientations();
-    mysift.DescriptorRepresentation();
-    mysift.write_features(featurefile);
+    Mat inputimage = imread("..//data//img1_500.jpg",0);
+    std::vector<KeyPoint> keypoints;
+    Mat descriptors;
+    sift sift1;
+    sift1.dosift(inputimage,Mat(),keypoints,descriptors);
+
+    Mat outputimage;
+    drawKeypoints(inputimage,keypoints,outputimage);
+
+    namedWindow("keypoints",0);
+    imshow("keypoints",outputimage);
+    waitKey();
+
+
     return 0;
 }
